@@ -1,4 +1,4 @@
-# bydesigns-db
+# Twill DB
 
 > DB Management System with separated process and storage layer. Built on Rust, and compatible with PostgreSQL.
 
@@ -6,7 +6,7 @@
 
 ## What this is
 
-`bydesigns-db` is an OLTP database engine that is, at the same time:
+**Twill DB** is an OLTP database engine that is, at the same time:
 
 - **Embeddable** — links in-process as a library, at function-call latency (SQLite-style), and
 - **Storage-disaggregated** — durable state lives on object storage (S3 / Cloudflare R2 / MinIO), so compute is stateless.
