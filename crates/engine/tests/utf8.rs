@@ -76,3 +76,23 @@ fn unexpected_non_ascii_character_is_reported_intact() {
         "error should name the character, got: {err}"
     );
 }
+
+/// JSON `\u` escapes outside the BMP arrive as UTF-16 surrogate pairs (Python's
+/// `json.dumps` writes them by default); the pair must decode to one code point,
+/// not two replacement characters.
+#[test]
+fn json_surrogate_pair_escapes_decode() {
+    let p = db_path("surrogates");
+    let mut db = open(&p);
+    let rs = db
+        .query(r#"SELECT '{"a":"\ud83e\udd80"}'::json ->> 'a', '{"b":"Jos\u00e9"}'::json ->> 'b'"#)
+        .unwrap();
+    assert_eq!(rs.rows[0][0].render().as_deref(), Some("🦀"));
+    assert_eq!(rs.rows[0][1].render().as_deref(), Some("José"));
+
+    db.exec("SET ROLE authenticated").unwrap();
+    db.exec(r#"SET twill.jwt.claims = '{"sub":"\ud83e\udd80"}'"#)
+        .unwrap();
+    let rs = db.query("SELECT auth.uid()").unwrap();
+    assert_eq!(rs.rows[0][0].render().as_deref(), Some("🦀"));
+}
