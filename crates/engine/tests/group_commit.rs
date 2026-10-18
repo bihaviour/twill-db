@@ -405,3 +405,52 @@ fn concurrent_same_key_inserts_never_duplicate() {
 
     let _ = fs::remove_file(&p);
 }
+
+/// Concurrent *cold* opens of one database (a burst of pgwire connections, or a
+/// pooler filling its backend set) must converge on a single storage handle.
+/// Two live `LocalFileStorage` handles over one file each keep a private append
+/// offset, and opening one heals a "torn" tail that may be the other's
+/// in-flight write — truncating it, so the surviving writer's acked commits
+/// land past a gap that the next cold open's recovery stops at (and discards).
+/// Every commit acked through the concurrently-opened handles must survive a
+/// cold reopen.
+#[test]
+fn concurrent_cold_opens_lose_no_acked_commit() {
+    const OPENERS: usize = 8;
+    const ROWS_PER_OPENER: usize = 10;
+    for round in 0..100 {
+        let p = db_path("cold-open");
+        let url = url_for(&p);
+        {
+            let mut c = Connection::open(&url).unwrap();
+            c.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+        } // the last handle drops: the database is cold again
+
+        let opened = Barrier::new(OPENERS);
+        let start = Barrier::new(OPENERS);
+        thread::scope(|s| {
+            for w in 0..OPENERS {
+                let (url, opened, start) = (&url, &opened, &start);
+                s.spawn(move || {
+                    opened.wait(); // every handle cold-opens at once
+                    let mut c = Connection::open(url).unwrap();
+                    start.wait(); // all held open together, then write
+                    for i in 0..ROWS_PER_OPENER {
+                        let id = w * ROWS_PER_OPENER + i;
+                        exec_retrying(&mut c, &format!("INSERT INTO t VALUES ({id})"));
+                    }
+                });
+            }
+        });
+
+        // Every handle has dropped: this replays from the file.
+        let mut c = Connection::open(&url).unwrap();
+        assert_eq!(
+            scalar_i64(&mut c, "SELECT COUNT(*) FROM t"),
+            (OPENERS * ROWS_PER_OPENER) as i64,
+            "round {round}: an acked commit was lost across concurrent cold opens"
+        );
+        drop(c);
+        let _ = fs::remove_file(&p);
+    }
+}

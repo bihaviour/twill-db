@@ -47,8 +47,30 @@ pub enum Canned {
     /// PostgREST-query-shaped output is for PostgREST's schema cache, not a
     /// generic client.
     Catalog(CatalogKind),
+    /// PostgREST's per-request `SELECT set_config(…), …` preamble, parsed into
+    /// its calls. The session resolves any bound `$n` values, forwards the RLS
+    /// principal (`role`, `request.jwt.claims`, `request.jwt.claim.*`) to the
+    /// engine, and replies with one row echoing each value set.
+    SetConfig(Vec<SetConfigCall>),
     /// Not intercepted — hand the statement to the engine.
     Pass,
+}
+
+/// One argument of a `set_config` call: a string literal or a bound `$n`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigArg {
+    Lit(String),
+    Param(usize),
+}
+
+/// One `set_config(name, value, is_local)` call. `is_local` is not kept: the
+/// engine's session principal has no transaction-local scope (an engine `SET
+/// LOCAL` likewise lasts until overwritten), and PostgREST re-sends role +
+/// claims at the start of every request, so each request replaces the last.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetConfigCall {
+    pub name: ConfigArg,
+    pub value: ConfigArg,
 }
 
 /// Which view of the live catalog the `twill.catalog` family reflects.
@@ -335,6 +357,122 @@ fn catalog_relationships_rows(catalog: &[CatalogTable]) -> Canned {
     }
 }
 
+/// Parse `SELECT set_config(<arg>, <arg>, <bool>)[, …]` where each `<arg>` is a
+/// `'string'` literal or a `$n` parameter (optionally `::type`-cast). Returns
+/// `None` for anything else, so an unexpected shape falls back rather than
+/// guessing.
+fn parse_set_config_list(sql: &str) -> Option<Vec<SetConfigCall>> {
+    let mut p = ArgScanner {
+        b: sql.trim().trim_end_matches(';').as_bytes(),
+        i: 0,
+    };
+    p.keyword("select")?;
+    let mut calls = Vec::new();
+    loop {
+        p.keyword("set_config")?;
+        p.punct(b'(')?;
+        let name = p.arg()?;
+        p.punct(b',')?;
+        let value = p.arg()?;
+        p.punct(b',')?;
+        // is_local: a bare `true`/`false` (or a bound parameter); not kept.
+        p.ws();
+        while p.i < p.b.len() && (p.b[p.i].is_ascii_alphanumeric() || p.b[p.i] == b'$') {
+            p.i += 1;
+        }
+        p.punct(b')')?;
+        calls.push(SetConfigCall { name, value });
+        p.ws();
+        if p.i == p.b.len() {
+            return Some(calls);
+        }
+        p.punct(b',')?;
+    }
+}
+
+/// A byte cursor for [`parse_set_config_list`]. Every delimiter it stops on is
+/// ASCII, so slicing between them is always on a UTF-8 boundary.
+struct ArgScanner<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl ArgScanner<'_> {
+    fn ws(&mut self) {
+        while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+
+    fn keyword(&mut self, kw: &str) -> Option<()> {
+        self.ws();
+        let end = self.i + kw.len();
+        let word = self.b.get(self.i..end)?;
+        let boundary =
+            !matches!(self.b.get(end), Some(c) if c.is_ascii_alphanumeric() || *c == b'_');
+        (word.eq_ignore_ascii_case(kw.as_bytes()) && boundary).then(|| self.i = end)
+    }
+
+    fn punct(&mut self, c: u8) -> Option<()> {
+        self.ws();
+        (self.b.get(self.i) == Some(&c)).then(|| self.i += 1)
+    }
+
+    fn arg(&mut self) -> Option<ConfigArg> {
+        self.ws();
+        let arg = match *self.b.get(self.i)? {
+            b'\'' => {
+                let mut out = Vec::new();
+                self.i += 1;
+                loop {
+                    match *self.b.get(self.i)? {
+                        b'\'' if self.b.get(self.i + 1) == Some(&b'\'') => {
+                            out.push(b'\'');
+                            self.i += 2;
+                        }
+                        b'\'' => {
+                            self.i += 1;
+                            break;
+                        }
+                        c => {
+                            out.push(c);
+                            self.i += 1;
+                        }
+                    }
+                }
+                ConfigArg::Lit(String::from_utf8(out).ok()?)
+            }
+            b'$' => {
+                let start = self.i + 1;
+                self.i = start;
+                while self.b.get(self.i).is_some_and(u8::is_ascii_digit) {
+                    self.i += 1;
+                }
+                let n = std::str::from_utf8(&self.b[start..self.i])
+                    .ok()?
+                    .parse()
+                    .ok()?;
+                ConfigArg::Param(n)
+            }
+            _ => return None,
+        };
+        // An optional `::type` cast (`$1::text`).
+        self.ws();
+        if self.b[self.i..].starts_with(b"::") {
+            self.i += 2;
+            self.ws();
+            while self
+                .b
+                .get(self.i)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            {
+                self.i += 1;
+            }
+        }
+        Some(arg)
+    }
+}
+
 /// Inspect a statement; return a canned answer or [`Canned::Pass`].
 pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     let s = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
@@ -376,10 +514,16 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     }
 
     // PostgREST's per-request preamble: `SELECT set_config('search_path', $1,
-    // true), set_config('role', $2, true), …`. It sets session GUCs (search_path,
-    // role, JWT claims) the engine has no notion of, and ignores the returned
-    // values — answer with one row of empty strings, one per set_config call.
+    // true), set_config('role', $2, true), set_config('request.jwt.claims', $3,
+    // true), …`. Parsed from the original (case-preserving) text so the session
+    // can forward the role + claims to the engine — this is the *only* way
+    // PostgREST conveys the request principal, so RLS depends on it (spec 17).
+    // A shape the parser does not recognize keeps the old answer: one row of
+    // empty strings, one per call (PostgREST ignores the values).
     if s.starts_with("select set_config(") {
+        if let Some(calls) = parse_set_config_list(sql) {
+            return Canned::SetConfig(calls);
+        }
         let n = s.matches("set_config(").count().max(1);
         return Canned::Rows {
             columns: vec!["set_config".to_string(); n],
@@ -691,6 +835,33 @@ mod tests {
                 Canned::Rows { rows, .. } if rows.is_empty()
             ));
         }
+    }
+
+    #[test]
+    fn set_config_preamble_is_parsed() {
+        use ConfigArg::{Lit, Param};
+        let call = |name, value| SetConfigCall { name, value };
+        match intercept(
+            "select set_config('search_path', $1, true), set_config('role', $2::text, true), \
+             set_config($3, 'it''s', false)",
+            "u",
+            "d",
+        ) {
+            Canned::SetConfig(calls) => assert_eq!(
+                calls,
+                vec![
+                    call(Lit("search_path".into()), Param(1)),
+                    call(Lit("role".into()), Param(2)),
+                    call(Param(3), Lit("it's".into())),
+                ]
+            ),
+            _ => panic!("preamble must parse into set_config calls"),
+        }
+        // An unrecognized shape keeps the canned one-row answer.
+        assert!(matches!(
+            intercept("SELECT set_config('a', lower('B'), true)", "u", "d"),
+            Canned::Rows { rows, .. } if rows.len() == 1
+        ));
     }
 
     #[test]

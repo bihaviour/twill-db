@@ -14,7 +14,7 @@ use crate::store::Store;
 use crate::wal::WalOp;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use twill_storage::{
     block_on, open_branch as storage_open_branch, open_storage, BranchId, FenceToken, Lsn, PageId,
     Storage, WriterId, PAGE_SIZE,
@@ -142,6 +142,60 @@ fn registry() -> &'static Mutex<HashMap<String, Weak<Database>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Per-key build locks: at most one `Database` is built for a key at a time.
+/// Building opens a fresh storage handle and acquires the fence, and two live
+/// handles over one `file://` log each keep a private append offset — worse,
+/// opening one heals a "torn" tail that may be the other's in-flight frame,
+/// truncating it so the surviving writer's acked commits land past a gap the
+/// next recovery stops at. Serializing builds per key (not globally, so cold
+/// opens of different databases still warm in parallel) means concurrent
+/// openers wait for the first build and then share it.
+fn build_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return the live shared `Database` for `key`, or build one with `build`
+/// under the key's build lock and register it.
+fn shared_or_build(key: &str, build: impl FnOnce() -> Result<Database>) -> Result<Arc<Database>> {
+    let live = |key: &str| registry().lock().unwrap().get(key).and_then(Weak::upgrade);
+    if let Some(existing) = live(key) {
+        return Ok(existing);
+    }
+    // Clones of a build lock are only taken under the map lock, so a lock
+    // whose only reference is the map's can be dropped from it safely.
+    let lock = Arc::clone(
+        build_locks()
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default(),
+    );
+    let result = {
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        // Re-check under the build lock: a concurrent opener may have just
+        // built it (every registry insert for this key happens under this lock).
+        // (`live` drops its registry guard before `build` runs and re-locks it.)
+        match live(key) {
+            Some(existing) => Ok(existing),
+            None => build().map(|db| {
+                let db = Arc::new(db);
+                registry()
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), Arc::downgrade(&db));
+                db
+            }),
+        }
+    };
+    let mut locks = build_locks().lock().unwrap();
+    drop(lock);
+    if locks.get(key).is_some_and(|l| Arc::strong_count(l) == 1) {
+        locks.remove(key);
+    }
+    result
+}
+
 /// Allocate a fresh in-flight-writer id, unique among concurrently committing
 /// transactions (it tags their pending store versions through group commit).
 /// `0` is reserved for "fully committed", so ids start at `1`.
@@ -185,42 +239,29 @@ impl Database {
     /// and replaying the durable WAL.
     pub fn open(url: &str) -> Result<Arc<Database>> {
         let key = registry_key(url);
-        {
-            let reg = registry().lock().unwrap();
-            if let Some(existing) = reg.get(&key).and_then(Weak::upgrade) {
-                return Ok(existing);
-            }
-        }
+        shared_or_build(&key, || {
+            let storage = open_storage(url)?;
+            let token = block_on(storage.acquire_fence(next_writer_id()))?;
 
-        let storage = open_storage(url)?;
-        let token = block_on(storage.acquire_fence(next_writer_id()))?;
+            let mut store = Store::default();
+            replay(storage.as_ref(), &mut store)?;
+            let committed = block_on(storage.get_commit_lsn())?;
+            store.committed_lsn = store.committed_lsn.max(committed.0);
+            let loaded = warm_vector_indexes(storage.as_ref(), &mut store);
 
-        let mut store = Store::default();
-        replay(storage.as_ref(), &mut store)?;
-        let committed = block_on(storage.get_commit_lsn())?;
-        store.committed_lsn = store.committed_lsn.max(committed.0);
-        let loaded = warm_vector_indexes(storage.as_ref(), &mut store);
-
-        let db = Arc::new(Database {
-            storage,
-            token,
-            store: RwLock::new(store),
-            lane: WriteLane::new(),
-            group_commit: GroupCommit::new(),
-            key: key.clone(),
-            url: url.to_string(),
-            branch: None,
-            fenced: AtomicBool::new(false),
-            index_pages_loaded: AtomicU64::new(loaded),
-        });
-
-        let mut reg = registry().lock().unwrap();
-        // Re-check in case of a race between the unlock above and here.
-        if let Some(existing) = reg.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
-        }
-        reg.insert(key, Arc::downgrade(&db));
-        Ok(db)
+            Ok(Database {
+                storage,
+                token,
+                store: RwLock::new(store),
+                lane: WriteLane::new(),
+                group_commit: GroupCommit::new(),
+                key: key.clone(),
+                url: url.to_string(),
+                branch: None,
+                fenced: AtomicBool::new(false),
+                index_pages_loaded: AtomicU64::new(loaded),
+            })
+        })
     }
 
     /// Open (or share) a copy-on-write branch of the database at `url`. The
@@ -229,41 +270,29 @@ impl Database {
     /// open_branch`), so a branch writer never touches the base or siblings.
     pub fn open_branch(url: &str, branch: BranchId) -> Result<Arc<Database>> {
         let key = format!("{}#branch={}", registry_key(url), branch.0);
-        {
-            let reg = registry().lock().unwrap();
-            if let Some(existing) = reg.get(&key).and_then(Weak::upgrade) {
-                return Ok(existing);
-            }
-        }
+        shared_or_build(&key, || {
+            let storage = storage_open_branch(url, branch)?;
+            let token = block_on(storage.acquire_fence(next_writer_id()))?;
 
-        let storage = storage_open_branch(url, branch)?;
-        let token = block_on(storage.acquire_fence(next_writer_id()))?;
+            let mut store = Store::default();
+            replay(storage.as_ref(), &mut store)?;
+            let committed = block_on(storage.get_commit_lsn())?;
+            store.committed_lsn = store.committed_lsn.max(committed.0);
+            let loaded = warm_vector_indexes(storage.as_ref(), &mut store);
 
-        let mut store = Store::default();
-        replay(storage.as_ref(), &mut store)?;
-        let committed = block_on(storage.get_commit_lsn())?;
-        store.committed_lsn = store.committed_lsn.max(committed.0);
-        let loaded = warm_vector_indexes(storage.as_ref(), &mut store);
-
-        let db = Arc::new(Database {
-            storage,
-            token,
-            store: RwLock::new(store),
-            lane: WriteLane::new(),
-            group_commit: GroupCommit::new(),
-            key: key.clone(),
-            url: url.to_string(),
-            branch: Some(branch),
-            fenced: AtomicBool::new(false),
-            index_pages_loaded: AtomicU64::new(loaded),
-        });
-
-        let mut reg = registry().lock().unwrap();
-        if let Some(existing) = reg.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
-        }
-        reg.insert(key, Arc::downgrade(&db));
-        Ok(db)
+            Ok(Database {
+                storage,
+                token,
+                store: RwLock::new(store),
+                lane: WriteLane::new(),
+                group_commit: GroupCommit::new(),
+                key: key.clone(),
+                url: url.to_string(),
+                branch: Some(branch),
+                fenced: AtomicBool::new(false),
+                index_pages_loaded: AtomicU64::new(loaded),
+            })
+        })
     }
 
     pub fn committed_lsn(&self) -> u64 {
