@@ -355,10 +355,46 @@ fn legacy_per_claim_gucs_and_literal_values_reach_the_engine() {
 
     // Dynamic GUC names (PostgREST's role/app settings use `set_config($1, $2, …)`).
     ok(&c.extended(
-        "select set_config($1, $2, true)",
-        &["request.jwt.claim.sub", "alice"],
+        "select set_config('role', $1, true), set_config($2, $3, true)",
+        &["authenticated", "request.jwt.claim.sub", "alice"],
     ));
     assert_eq!(ids(&c.simple("SELECT id FROM notes")), vec!["1"]);
+}
+
+#[test]
+fn a_preamble_replaces_the_whole_principal() {
+    // PostgREST < 10 sends no claim GUCs at all for an anonymous request. The
+    // previous request's claims must not survive into it: a policy open to every
+    // role that keys on auth.uid() would otherwise still match the last user.
+    let addr = start_server();
+    let mut c = Client::connect(&addr);
+    ok(&c.simple("CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT)"));
+    ok(&c.simple("INSERT INTO notes VALUES (1,'alice'),(2,'bob')"));
+    ok(&c.simple("ALTER TABLE notes ENABLE ROW LEVEL SECURITY"));
+    ok(&c.simple("CREATE POLICY own ON notes FOR SELECT USING (owner = auth.uid())"));
+
+    ok(&c.simple(
+        "SELECT set_config('role', 'authenticated', true), \
+         set_config('request.jwt.claim.sub', 'alice', true)",
+    ));
+    assert_eq!(ids(&c.simple("SELECT id FROM notes")), vec!["1"]);
+
+    // Next request: anonymous, role only.
+    ok(&c.simple("SELECT set_config('role', 'anon', true)"));
+    assert!(
+        ids(&c.simple("SELECT id FROM notes")).is_empty(),
+        "alice's claims leaked into the anonymous request"
+    );
+
+    // And the converse: claims only, after a role was set, resets the role.
+    ok(&c.simple("SELECT set_config('role', 'authenticated', true)"));
+    ok(&c.simple("SELECT set_config('request.jwt.claims', '{\"sub\":\"bob\"}', true)"));
+    let r = c.simple("SELECT auth.role()");
+    assert_eq!(data_rows(&r), vec![vec![Some("anon".into())]], "{r:?}");
+
+    // A preamble touching no principal GUC leaves the principal alone.
+    ok(&c.simple("SELECT set_config('search_path', 'public', true)"));
+    assert_eq!(ids(&c.simple("SELECT id FROM notes")), vec!["2"]);
 }
 
 #[test]

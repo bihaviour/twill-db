@@ -735,8 +735,10 @@ impl Session {
     /// per-claim `request.jwt.claim.<k>` GUCs folded into one object) as `SET
     /// twill.jwt.claims` — exactly as an explicit client `SET` reaches it, and
     /// reply as Postgres does: one row, one text column per call, each the value
-    /// set. Every other GUC (search_path, request.method/path/headers, …) has no
-    /// engine meaning and is only echoed.
+    /// set. A call list that sets any part of the principal replaces the whole
+    /// principal (an omitted role or claims is reset). Every other GUC
+    /// (search_path, request.method/path/headers, …) has no engine meaning and
+    /// is only echoed.
     fn apply_set_config(
         &mut self,
         calls: &[introspect::SetConfigCall],
@@ -781,6 +783,14 @@ impl Session {
         }
         if claims.is_none() && !per_claim.is_empty() {
             claims = Some(Some(claims_object(&per_claim)));
+        }
+        // A preamble that sets any part of the principal replaces all of it: a
+        // part it leaves out is reset, never inherited from the previous request
+        // on this pooled connection. (PostgREST < 10 sends no claim GUCs for an
+        // anonymous request — the last user's claims must not survive into it.)
+        if role.is_some() || claims.is_some() {
+            role.get_or_insert(None);
+            claims.get_or_insert(None);
         }
 
         let mut stmts = Vec::new();
