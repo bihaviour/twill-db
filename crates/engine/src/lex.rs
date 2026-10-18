@@ -85,10 +85,12 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Tok>> {
             _ if c.is_ascii_digit() => lex_number(b, i)?,
             _ if c == b'_' || c.is_ascii_alphabetic() => lex_word(b, i),
             other => {
-                return Err(EngineError::sql(format!(
-                    "unexpected character '{}'",
-                    other as char
-                )))
+                // Name the whole (possibly multi-byte) character, not its lead byte.
+                let ch = sql
+                    .get(i..)
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or(other as char);
+                return Err(EngineError::sql(format!("unexpected character '{ch}'")));
             }
         };
         out.push(tok);
@@ -217,22 +219,27 @@ fn lex_lt(b: &[u8], i: usize) -> (Tok, usize) {
 }
 
 /// String literal; `''` escapes a single quote. `i` points at the opening quote.
+/// Bytes are collected and decoded as UTF-8 once, so multi-byte characters
+/// survive intact (pushing each byte `as char` would read them as Latin-1).
 fn lex_string(b: &[u8], mut i: usize) -> Result<(Tok, usize)> {
     i += 1;
-    let mut s = String::new();
+    let mut bytes = Vec::new();
     loop {
         let Some(&ch) = b.get(i) else {
             return Err(EngineError::sql("unterminated string literal"));
         };
         if ch == b'\'' {
             if b.get(i + 1) == Some(&b'\'') {
-                s.push('\'');
+                bytes.push(b'\'');
                 i += 2;
             } else {
+                // `b` is a `&str`'s bytes and the delimiters are ASCII, so the
+                // collected run is always valid UTF-8.
+                let s = String::from_utf8(bytes).expect("literal is a slice of a &str");
                 return Ok((Tok::Str(s), i + 1));
             }
         } else {
-            s.push(ch as char);
+            bytes.push(ch);
             i += 1;
         }
     }

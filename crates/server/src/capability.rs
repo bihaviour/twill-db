@@ -195,8 +195,8 @@ pub const CATALOG_QUERIES: &[CatalogCap] = &[
     },
     CatalogCap {
         marker: "set_config(",
-        purpose: "PostgREST per-request preamble",
-        support: Support::Stubbed,
+        purpose: "PostgREST per-request preamble (role + JWT claims set the RLS principal)",
+        support: Support::Answered,
         clients: "PostgREST",
     },
     CatalogCap {

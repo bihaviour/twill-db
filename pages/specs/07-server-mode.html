@@ -538,7 +538,8 @@ non-goal, rejected with a typed error).</p>
 <tr><td><code>current_schema/database/user</code> · <code>pg_backend_pid()</code></td><td>Answered</td><td>identity probes · Bun.sql, ORMs</td></tr>
 <tr><td><code>twill.stats</code></td><td>Answered</td><td>in-band observability surface (#53 / EX-4)</td></tr>
 <tr><td><code>pg_relation_is_updatable</code> (tables/PKs) · <code>pks_uniques_cols</code> (FKs)</td><td>Reflected</td><td>PostgREST schema cache, from the live catalog</td></tr>
-<tr><td><code>SET</code> · <code>set_config()</code> · <code>DISCARD</code> · <code>LISTEN</code></td><td>Stubbed</td><td>session setup drivers fire-and-forget</td></tr>
+<tr><td><code>set_config()</code> (PostgREST per-request preamble)</td><td>Answered</td><td><code>role</code> / <code>request.jwt.claims</code> set the engine's RLS principal (<a href="17-row-level-security.html">17</a>); each value is echoed back · PostgREST</td></tr>
+<tr><td><code>SET</code> · <code>DISCARD</code> · <code>LISTEN</code></td><td>Stubbed</td><td>session setup drivers fire-and-forget (the RLS-principal <code>SET</code>s reach the engine)</td></tr>
 <tr><td><code>pg_timezone_names</code> · <code>pg_cast</code> · <code>computed_rels</code> · <code>rettype_is_setof</code> · <code>pks_fks</code> · <code>pg_db_role_setting</code> · <code>pg_auth_members</code></td><td>Stubbed</td><td>PostgREST schema-cache queries for concepts the engine lacks → empty, correctly-shaped</td></tr>
 <tr><td>any other <code>pg_catalog.</code> / <code>information_schema.</code> / <code>::regclass</code> query</td><td>Errored</td><td>clear <code>0A000 feature_not_supported</code>, never a baffling parser error</td></tr>
 </tbody>

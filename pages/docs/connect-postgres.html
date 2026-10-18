@@ -116,6 +116,7 @@ await client.end();</code></pre>
 </tbody>
 </table>
 </div>
+<p>Errors carry the SQLSTATE a Postgres driver expects, so client code can branch on the code: <code>23505</code> unique / primary-key violation, <code>23502</code> NOT NULL, <code>23514</code> CHECK, <code>42501</code> a write rejected by a row-level security policy, <code>0A000</code> a recognized but unsupported feature, <code>40001</code> a write conflict or fenced writer (retry it), <code>25000</code> an invalid transaction state, and <code>42601</code> for malformed SQL. Foreign keys are metadata only, so <code>23503</code> is never raised.</p>
 <div class="callout warning">
 <p class="callout-title">It is a subset, not full Postgres</p>
 <p>Aiming for full Postgres wire/SQL fidelity is out of scope. The SQL surface is the engine's focused subset (see the <a href="sql-reference.html">SQL reference</a>); a driver that depends on Postgres-specific catalog introspection or features outside the subset may not connect cleanly. Stick to the clients and queries above.</p>
