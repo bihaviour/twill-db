@@ -77,7 +77,9 @@ jobs:
         with:
           python-version: "3.x"
       - name: Install lizard
-        run: pip install lizard
+        # Pinned: lizard 1.24.1 changed Rust CCN counting and flags a dozen
+        # unchanged functions; bump deliberately, not by drift.
+        run: pip install lizard==1.24.0
       - name: Complexity gate (CCN <= 25, args <= 8)
         run: |
           lizard crates clients/bun/src clients/bun/test clients/bun/examples \

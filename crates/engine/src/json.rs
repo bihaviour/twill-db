@@ -237,13 +237,17 @@ impl Parser<'_> {
                         'b' => s.push('\u{8}'),
                         'f' => s.push('\u{c}'),
                         'u' => {
-                            let mut code = 0u32;
-                            for _ in 0..4 {
-                                let h = self.b.get(self.i)?.to_digit(16)?;
-                                code = code * 16 + h;
-                                self.i += 1;
-                            }
-                            s.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                            // Astral code points arrive as a UTF-16 surrogate pair
+                            // of escapes; a lone surrogate decodes to U+FFFD.
+                            let code = self.hex4()?;
+                            let ch = if (0xD800..0xDC00).contains(&code) {
+                                self.low_surrogate()
+                                    .map(|lo| 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00))
+                                    .and_then(char::from_u32)
+                            } else {
+                                char::from_u32(code)
+                            };
+                            s.push(ch.unwrap_or(char::REPLACEMENT_CHARACTER));
                         }
                         _ => return None,
                     }
@@ -252,6 +256,33 @@ impl Parser<'_> {
             }
         }
         None
+    }
+
+    /// Four hex digits of a `\uXXXX` escape, consumed.
+    fn hex4(&mut self) -> Option<u32> {
+        let mut code = 0u32;
+        for _ in 0..4 {
+            code = code * 16 + self.b.get(self.i)?.to_digit(16)?;
+            self.i += 1;
+        }
+        Some(code)
+    }
+
+    /// A `\uXXXX` low surrogate (DC00..=DFFF) following a high one, consumed
+    /// only if present — anything else is left for the main loop.
+    fn low_surrogate(&mut self) -> Option<u32> {
+        if self.b.get(self.i) != Some(&'\\') || self.b.get(self.i + 1) != Some(&'u') {
+            return None;
+        }
+        let save = self.i;
+        self.i += 2;
+        match self.hex4() {
+            Some(lo) if (0xDC00..0xE000).contains(&lo) => Some(lo),
+            _ => {
+                self.i = save;
+                None
+            }
+        }
     }
 
     fn array(&mut self) -> Option<Json> {
@@ -326,6 +357,18 @@ mod tests {
             Some("30")
         );
         assert!(j.get_key("missing").is_none());
+    }
+
+    #[test]
+    fn decodes_surrogate_pairs() {
+        let text = |src: &str| Json::parse(src).unwrap().as_text();
+        assert_eq!(text(r#""\ud83e\udd80""#).as_deref(), Some("🦀"));
+        // Lone surrogates (high without low, bare low) become U+FFFD, and a high
+        // surrogate never swallows a following non-low escape.
+        assert_eq!(text(r#""\ud83ex""#).as_deref(), Some("�x"));
+        assert_eq!(text(r#""\udd80""#).as_deref(), Some("�"));
+        assert_eq!(text(r#""\ud83e\u0041""#).as_deref(), Some("�A"));
+        assert_eq!(text(r#""\ud83e\n""#).as_deref(), Some("�\n"));
     }
 
     #[test]
