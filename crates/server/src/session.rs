@@ -12,7 +12,7 @@ use crate::reflect;
 use crate::types::{
     column_type_oid, decode_param, encode_value, infer_column_oid, type_len, OID_TEXT,
 };
-use engine::{Connection, Value};
+use engine::{Connection, EngineError, EngineStatus, Value};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
@@ -55,6 +55,10 @@ enum Postprocess {
 struct Portal {
     stmt: String,
     params: Vec<Value>,
+    /// The parameters as the client sent them (UTF-8 text), before
+    /// [`decode_param`]'s numeric inference — `set_config` values are text and
+    /// must round-trip exactly (`'007'` stays `007`).
+    raw_params: Vec<Option<String>>,
     result_formats: Vec<i16>,
     materialized: Option<Mat>,
 }
@@ -272,6 +276,22 @@ impl Session {
             Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Stats => unreachable!("inspect() resolves Stats"),
             Canned::Catalog(_) => unreachable!("inspect() resolves Catalog"),
+            Canned::SetConfig(calls) => match self.apply_set_config(&calls, &[]) {
+                Ok(m) => {
+                    crate::metrics::query_ok(m.rows.len());
+                    self.send_rows(out, &m.columns, &m.oids, &m.rows, &[]);
+                    out.command_complete(&m.tag);
+                    Ok(())
+                }
+                Err((code, msg)) => {
+                    crate::metrics::query_err();
+                    out.error("ERROR", &code, &msg);
+                    if self.conn.in_transaction() {
+                        self.failed_txn = true;
+                    }
+                    Err(())
+                }
+            },
             Canned::Pass => {
                 // A system-catalog query outside the frozen subset: answer with a
                 // clear feature_not_supported error rather than letting it fall
@@ -300,7 +320,7 @@ impl Session {
                     }
                     Err(e) => {
                         crate::metrics::query_err();
-                        let (code, msg) = describe_error(&e.to_string());
+                        let (code, msg) = describe_error(&e);
                         out.error("ERROR", code, &msg);
                         if self.conn.in_transaction() {
                             self.failed_txn = true;
@@ -383,7 +403,7 @@ impl Session {
         let prepared = if to_engine {
             let (rewritten, order) = rewrite_placeholders(&engine_sql);
             if let Err(e) = self.conn.prepare(&rewritten) {
-                let (code, msg) = describe_error(&e.to_string());
+                let (code, msg) = describe_error(&e);
                 return self.fail(out, code, &msg);
             }
             let nparams = order.iter().copied().max().unwrap_or(0);
@@ -395,10 +415,16 @@ impl Session {
                 postprocess,
             }
         } else {
+            // An intercepted statement never reaches the engine; only the
+            // set_config preamble carries `$n` parameters worth describing.
+            let nparams = match introspect::intercept(&sql, &self.user, &self.database) {
+                Canned::SetConfig(_) => datapath::max_param(&sql),
+                _ => 0,
+            };
             Prepared {
                 sql,
                 order: vec![],
-                nparams: 0,
+                nparams,
                 param_oids,
                 postprocess: Postprocess::None,
             }
@@ -436,6 +462,10 @@ impl Session {
             Portal {
                 stmt,
                 params: values,
+                raw_params: params
+                    .iter()
+                    .map(|p| p.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()))
+                    .collect(),
                 result_formats,
                 materialized: None,
             },
@@ -499,6 +529,11 @@ impl Session {
                 Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
                 Canned::Stats => unreachable!("inspect() resolves Stats"),
                 Canned::Catalog(_) => unreachable!("inspect() resolves Catalog"),
+                Canned::SetConfig(calls) => {
+                    let columns = vec!["set_config".to_string(); calls.len()];
+                    let oids = vec![OID_TEXT; calls.len()];
+                    out.row_description(&fields(&columns, &oids, &[]));
+                }
                 Canned::Pass if is_row_returning(&sql) => match self.dummy_columns(&sql, order_len)
                 {
                     Ok(Some((columns, oids))) => out.row_description(&fields(&columns, &oids, &[])),
@@ -581,6 +616,7 @@ impl Session {
         let sql = prep.sql.clone();
         let order = prep.order.clone();
         let params = p.params.clone();
+        let raw_params = p.raw_params.clone();
         // Extract what the postprocess paths need without holding the borrow.
         let insert_plan = match &prep.postprocess {
             Postprocess::PgrstInsert(plan) => Some((plan.table.clone(), plan.columns.clone())),
@@ -686,10 +722,104 @@ impl Session {
             Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Stats => unreachable!("inspect() resolves Stats"),
             Canned::Catalog(_) => unreachable!("inspect() resolves Catalog"),
+            Canned::SetConfig(calls) => self.apply_set_config(&calls, &raw_params)?,
             Canned::Pass => self.run_engine(&sql, &params, &order)?,
         };
         self.portals.get_mut(portal).unwrap().materialized = Some(mat);
         Ok(())
+    }
+
+    /// Run PostgREST's `set_config` preamble: resolve each call's name/value
+    /// (literal or bound `$n`), forward the RLS principal to the engine session
+    /// — `role` as `SET ROLE`, `request.jwt.claims` (or, from PostgREST < 10, the
+    /// per-claim `request.jwt.claim.<k>` GUCs folded into one object) as `SET
+    /// twill.jwt.claims` — exactly as an explicit client `SET` reaches it, and
+    /// reply as Postgres does: one row, one text column per call, each the value
+    /// set. Every other GUC (search_path, request.method/path/headers, …) has no
+    /// engine meaning and is only echoed.
+    fn apply_set_config(
+        &mut self,
+        calls: &[introspect::SetConfigCall],
+        params: &[Option<String>],
+    ) -> Result<Mat, (String, String)> {
+        let resolve = |a: &introspect::ConfigArg| -> Result<Option<String>, (String, String)> {
+            match a {
+                introspect::ConfigArg::Lit(s) => Ok(Some(s.clone())),
+                introspect::ConfigArg::Param(n) => {
+                    match n.checked_sub(1).and_then(|i| params.get(i)) {
+                        Some(v) => Ok(v.clone()),
+                        None => Err(("42P02".into(), format!("there is no parameter ${n}"))),
+                    }
+                }
+            }
+        };
+        let mut role: Option<Option<String>> = None;
+        let mut claims: Option<Option<String>> = None;
+        let mut per_claim: Vec<(String, String)> = Vec::new();
+        let mut row = Vec::with_capacity(calls.len());
+        for call in calls {
+            let name = resolve(&call.name)?
+                .ok_or_else(|| {
+                    (
+                        "22004".to_string(),
+                        "set_config name must not be NULL".to_string(),
+                    )
+                })?
+                .to_ascii_lowercase();
+            let value = resolve(&call.value)?.filter(|v| !v.is_empty());
+            match name.as_str() {
+                "role" => role = Some(value.clone()),
+                "request.jwt.claims" => claims = Some(value.clone()),
+                _ => {
+                    if let (Some(key), Some(v)) = (name.strip_prefix("request.jwt.claim."), &value)
+                    {
+                        per_claim.push((key.to_string(), v.clone()));
+                    }
+                }
+            }
+            row.push(Value::Text(value.unwrap_or_default()));
+        }
+        if claims.is_none() && !per_claim.is_empty() {
+            claims = Some(Some(claims_object(&per_claim)));
+        }
+
+        let mut stmts = Vec::new();
+        match role {
+            Some(Some(r)) if r.eq_ignore_ascii_case("none") => stmts.push("RESET ROLE".to_string()),
+            Some(Some(r)) => {
+                // The engine's quoted identifiers have no `""` escape, so a role
+                // that contains a quote cannot be forwarded intact — refuse it
+                // rather than splice it into SQL.
+                if r.contains(['"', '\0']) {
+                    return Err((
+                        "22023".into(),
+                        format!("invalid role name for set_config: {r:?}"),
+                    ));
+                }
+                stmts.push(format!("SET ROLE \"{r}\""));
+            }
+            Some(None) => stmts.push("RESET ROLE".to_string()),
+            None => {}
+        }
+        match claims {
+            Some(Some(c)) => stmts.push(format!(
+                "SET twill.jwt.claims = '{}'",
+                c.replace('\'', "''")
+            )),
+            Some(None) => stmts.push("RESET twill.jwt.claims".to_string()),
+            None => {}
+        }
+        for stmt in stmts {
+            self.conn.query(&stmt).map_err(|e| split_err(&e))?;
+        }
+
+        Ok(Mat {
+            columns: vec!["set_config".to_string(); calls.len()],
+            oids: vec![OID_TEXT; calls.len()],
+            rows: vec![row],
+            tag: "SELECT 1".to_string(),
+            has_rows: true,
+        })
     }
 
     /// Cache a write's response (return=minimal): a single row whose `page_total`
@@ -736,21 +866,18 @@ impl Session {
         };
         // The SET `?`s pass through unchanged; only the WHERE `$n` are rewritten.
         let (rewritten, where_order) = rewrite_placeholders(&engine_sql);
-        let mut st = self
-            .conn
-            .prepare(&rewritten)
-            .map_err(|e| split_err(&e.to_string()))?;
+        let mut st = self.conn.prepare(&rewritten).map_err(|e| split_err(&e))?;
         let mut pos = 1;
         for v in row {
-            st.bind(pos, v).map_err(|e| split_err(&e.to_string()))?;
+            st.bind(pos, v).map_err(|e| split_err(&e))?;
             pos += 1;
         }
         for &num in &where_order {
             let v = params.get(num - 1).cloned().unwrap_or(Value::Null);
-            st.bind(pos, v).map_err(|e| split_err(&e.to_string()))?;
+            st.bind(pos, v).map_err(|e| split_err(&e))?;
             pos += 1;
         }
-        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        st.execute().map_err(|e| split_err(&e))?;
         Ok(self.conn.last_changes)
     }
 
@@ -768,15 +895,12 @@ impl Session {
             format!("DELETE FROM {table} WHERE {where_clause}")
         };
         let (rewritten, order) = rewrite_placeholders(&engine_sql);
-        let mut st = self
-            .conn
-            .prepare(&rewritten)
-            .map_err(|e| split_err(&e.to_string()))?;
+        let mut st = self.conn.prepare(&rewritten).map_err(|e| split_err(&e))?;
         for (j, &num) in order.iter().enumerate() {
             let v = params.get(num - 1).cloned().unwrap_or(Value::Null);
-            st.bind(j + 1, v).map_err(|e| split_err(&e.to_string()))?;
+            st.bind(j + 1, v).map_err(|e| split_err(&e))?;
         }
-        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        st.execute().map_err(|e| split_err(&e))?;
         Ok(self.conn.last_changes)
     }
 
@@ -800,14 +924,11 @@ impl Session {
         );
         let mut count = 0i64;
         for row in rows {
-            let mut st = self
-                .conn
-                .prepare(&sql)
-                .map_err(|e| split_err(&e.to_string()))?;
+            let mut st = self.conn.prepare(&sql).map_err(|e| split_err(&e))?;
             for (i, v) in row.into_iter().enumerate() {
-                st.bind(i + 1, v).map_err(|e| split_err(&e.to_string()))?;
+                st.bind(i + 1, v).map_err(|e| split_err(&e))?;
             }
-            st.execute().map_err(|e| split_err(&e.to_string()))?;
+            st.execute().map_err(|e| split_err(&e))?;
             count += 1;
         }
         Ok(count)
@@ -910,18 +1031,15 @@ impl Session {
             e.rel_table,
             e.rel_col
         );
-        let mut st = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| split_err(&e.to_string()))?;
-        st.bind(1, key).map_err(|e| split_err(&e.to_string()))?;
-        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        let mut st = self.conn.prepare(&sql).map_err(|e| split_err(&e))?;
+        st.bind(1, key).map_err(|e| split_err(&e))?;
+        st.execute().map_err(|e| split_err(&e))?;
         let nc = st.column_count();
         let columns: Vec<String> = (0..nc)
             .map(|c| st.column_name(c).unwrap_or("").to_string())
             .collect();
         let mut rows = Vec::new();
-        while st.step().map_err(|e| split_err(&e.to_string()))? {
+        while st.step().map_err(|e| split_err(&e))? {
             let row: Vec<Value> = (0..nc)
                 .map(|c| st.column_value(c).cloned().unwrap_or(Value::Null))
                 .collect();
@@ -938,15 +1056,12 @@ impl Session {
         params: &[Value],
         order: &[usize],
     ) -> Result<Mat, (String, String)> {
-        let mut st = self
-            .conn
-            .prepare(sql)
-            .map_err(|e| split_err(&e.to_string()))?;
+        let mut st = self.conn.prepare(sql).map_err(|e| split_err(&e))?;
         for (j, &num) in order.iter().enumerate() {
             let v = params.get(num - 1).cloned().unwrap_or(Value::Null);
-            st.bind(j + 1, v).map_err(|e| split_err(&e.to_string()))?;
+            st.bind(j + 1, v).map_err(|e| split_err(&e))?;
         }
-        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        st.execute().map_err(|e| split_err(&e))?;
 
         let ncols = st.column_count();
         if ncols > 0 {
@@ -957,7 +1072,7 @@ impl Session {
                 .map(|c| st.column_type(c).map(column_type_oid).unwrap_or(OID_TEXT))
                 .collect();
             let mut rows = Vec::new();
-            while st.step().map_err(|e| split_err(&e.to_string()))? {
+            while st.step().map_err(|e| split_err(&e))? {
                 let row: Vec<Value> = (0..ncols)
                     .map(|c| st.column_value(c).cloned().unwrap_or(Value::Null))
                     .collect();
@@ -992,15 +1107,11 @@ impl Session {
         sql: &str,
         order_len: usize,
     ) -> Result<Option<(Vec<String>, Vec<i32>)>, (String, String)> {
-        let mut st = self
-            .conn
-            .prepare(sql)
-            .map_err(|e| split_err(&e.to_string()))?;
+        let mut st = self.conn.prepare(sql).map_err(|e| split_err(&e))?;
         for j in 0..order_len {
-            st.bind(j + 1, Value::Null)
-                .map_err(|e| split_err(&e.to_string()))?;
+            st.bind(j + 1, Value::Null).map_err(|e| split_err(&e))?;
         }
-        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        st.execute().map_err(|e| split_err(&e))?;
         let nc = st.column_count();
         if nc > 0 {
             let columns = (0..nc)
@@ -1209,26 +1320,88 @@ fn command_tag(class: &str, rows: usize, changes: i64) -> String {
     }
 }
 
-/// Map an engine error message to a SQLSTATE + message. A fenced/lost writer
-/// gets a defined code (spec 07 MUST); everything else is a syntax/usage error.
-fn describe_error(msg: &str) -> (&'static str, String) {
-    let lower = msg.to_ascii_lowercase();
-    let code =
-        if lower.contains("conflict") || lower.contains("fenced") || lower.contains("durability") {
-            // serialization_failure: first-committer-wins conflict or a lost-writer
-            // step-down. A retry-able class — clients (pgbench --max-tries) may retry.
-            "40001"
-        } else if lower.contains("transaction") {
-            "25000" // invalid_transaction_state
-        } else {
-            "42601" // syntax_error / generic statement failure
-        };
+/// Map an engine error to a SQLSTATE + message. Keyed on the engine's
+/// structured [`EngineStatus`] first, so a message that merely *mentions* a
+/// keyword (`ON CONFLICT`, `transaction`) is never misclassified; within a status
+/// class the engine's fixed message prefix picks the precise code clients branch
+/// on (`23505` unique vs `23502` NOT NULL vs `42501` RLS). A fenced/lost writer
+/// gets a defined, retry-able code (spec 07 MUST).
+fn describe_error(e: &EngineError) -> (&'static str, String) {
+    let msg = e.message.as_str();
+    let code = match e.status {
+        // serialization_failure: first-committer-wins conflict or a fenced
+        // writer. A retry-able class — clients (pgbench --max-tries) may retry.
+        EngineStatus::ErrConflict => "40001",
+        EngineStatus::ErrConstraint => constraint_sqlstate(msg),
+        EngineStatus::ErrTxn => "25000", // invalid_transaction_state
+        // A lost-writer step-down whose durability is unconfirmed: retry-able.
+        EngineStatus::ErrStorage if msg.starts_with("durability unconfirmed") => "40001",
+        EngineStatus::ErrSql if is_unsupported(msg) => "0A000", // feature_not_supported
+        _ => "42601", // syntax_error / generic statement failure
+    };
     (code, msg.to_string())
 }
 
-fn split_err(msg: &str) -> (String, String) {
-    let (c, m) = describe_error(msg);
+/// The precise SQLSTATE for an engine constraint error, matched on the fixed
+/// message texts `exec.rs` raises. The engine does not enforce foreign keys
+/// (metadata only), so `23503` never arises.
+fn constraint_sqlstate(msg: &str) -> &'static str {
+    if msg.starts_with("UNIQUE constraint failed") {
+        "23505" // unique_violation (PRIMARY KEY or UNIQUE)
+    } else if msg.starts_with("NOT NULL constraint failed") {
+        "23502" // not_null_violation
+    } else if msg.starts_with("CHECK constraint failed") {
+        "23514" // check_violation
+    } else if msg.starts_with("new row violates row-level security policy") {
+        "42501" // insufficient_privilege — what Postgres raises for WITH CHECK
+    } else if msg.starts_with("vector dimension mismatch") || msg.contains(" is vector(") {
+        "22000" // data_exception — pgvector's code for a dimension mismatch
+    } else {
+        "23000" // integrity_constraint_violation
+    }
+}
+
+/// Whether an engine SQL error reports a recognized-but-unimplemented feature
+/// (`… is not supported`, `unsupported …`) rather than malformed SQL. The
+/// parser's catch-all for an unknown leading keyword (`unsupported statement
+/// starting at …`) is excluded: it fires just as well for a typo (`SELEC 1`),
+/// which Postgres reports as a syntax error.
+fn is_unsupported(msg: &str) -> bool {
+    if msg.starts_with("unsupported statement") {
+        return false;
+    }
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("not supported") || lower.contains("unsupported")
+}
+
+fn split_err(e: &EngineError) -> (String, String) {
+    let (c, m) = describe_error(e);
     (c.to_string(), m)
+}
+
+/// Fold PostgREST < 10's per-claim GUCs (`request.jwt.claim.<k>` = text) into
+/// the single claims object the engine's `auth.claim()` reads.
+fn claims_object(pairs: &[(String, String)]) -> String {
+    let quote = |s: &str| {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    };
+    let body = pairs
+        .iter()
+        .map(|(k, v)| format!("{}:{}", quote(k), quote(v)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
 }
 
 /// The JSON request body for a PostgREST write — always the first parameter
